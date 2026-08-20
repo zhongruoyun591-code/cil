@@ -32,8 +32,8 @@ class iCIFAR10(iData):
     class_order = np.arange(10).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR10(f'{self.dataset_dir}', train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR10(f'{self.dataset_dir}', train=False, download=True)
+        train_dataset = datasets.cifar.CIFAR10("../data", train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR10("../data", train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(train_dataset.targets)
         self.test_data, self.test_targets = test_dataset.data, np.array(test_dataset.targets)
 
@@ -54,8 +54,8 @@ class iCIFAR100(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100(f'{self.dataset_dir}', train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100(f'{self.dataset_dir}', train=False, download=True)
+        train_dataset = datasets.cifar.CIFAR100("../data", train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR100("../data", train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(train_dataset.targets)
         self.test_data, self.test_targets = test_dataset.data, np.array(test_dataset.targets)
 
@@ -130,8 +130,8 @@ class iCIFAR224(iData):
         self.class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100(f'{self.dataset_dir}', train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100(f'{self.dataset_dir}', train=False, download=True)
+        train_dataset = datasets.cifar.CIFAR100("../data", train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR100("../data", train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(train_dataset.targets)
         self.test_data, self.test_targets = test_dataset.data, np.array(test_dataset.targets)
 
@@ -209,8 +209,8 @@ class iImageNetR(iData):
         self.class_order = np.arange(200).tolist()
 
     def download_data(self):
-        train_dir = os.path.join(self.dataset_dir, 'imagenet-r', 'train')
-        test_dir = os.path.join(self.dataset_dir, 'imagenet-r', 'test')
+        train_dir = os.path.join("../data", 'imagenet-r', 'train')
+        test_dir = os.path.join("../data", 'imagenet-r', 'test')
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)

@@ -25,7 +25,10 @@ class Context:
         self.known_classes = 0
 
     def next_task(self):
-        if self.cur_task < self.num_tasks - 1:
+        # 修复 off-by-one: 原条件 `< self.num_tasks - 1` 导致最后一个任务无法推进,
+        # 使得最后一次迭代重复上一次任务的类范围,最后一批类从未被训练/评估
+        # (例: CIFAR-100 B0-inc5 只覆盖 95/100 类)。详见 diag/verify_context_fix.py。
+        if self.cur_task < self.num_tasks:
             self.cur_task += 1
             self.known_classes += self.cur_task_size
 
