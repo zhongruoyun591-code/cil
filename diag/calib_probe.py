@@ -8,7 +8,12 @@ Phase 8 探针: post-hoc margin 校准能追回多少"跨任务混淆"损失?
      - baseline : cos(x, μ_c)                     (≈ diag 的 A_merge_fresh)
      - oracle   : s·cos(x, μ_c) + b_c, 用全部已见类训练特征做 CE 训练(校准天花板,非增量合法)
      - geometry : cos(x, μ_c) − α·max_{c'∈其他任务} cos(μ_c, μ_{c'}),α 仅用最后任务训练数据网格选(增量合法)
-  3) 对标 diag 的 A_tid 末行(任务边界已知的上限),报告每个变体对"混淆缺口"的追回率。
+  3) 逐样本路由(零训练, 增量合法; 注意"单类最大余弦路由"与全局 argmax 恒等,故用聚合证据):
+     - centroid : ŝ = argmax_s cos(z, 任务 s 原型均值)
+     - softsum  : ŝ = argmax_s Σ_{c∈C_s} exp(cos(z, μ_c))
+     - topk5    : ŝ = 全局 top-5 类多数票任务
+     路由后在 ŝ 内做类内 argmax;
+  4) 对标 diag 的 A_tid 末行(任务边界已知的上限),报告每个变体对"混淆缺口"的追回率。
 
 用法(在 ACMap 仓库根目录):
   python diag/calib_probe.py --config exps/cifar.yaml --init_cls 0 --increment 5 --seed 1993
@@ -128,6 +133,96 @@ def variant_geometry(P, ranges):
     return Pn, d_c
 
 
+def variant_linear(tr_feats, tr_labels, te_feats, test_labels, n_classes, epochs, lr, device):
+    """线性探针: 全量训练特征上训练 nn.Linear + CE(天花板: 线性可分性)。"""
+    X = tr_feats.to(device)
+    y = tr_labels.to(device)
+    W = torch.zeros(n_classes, X.shape[1], device=device)
+    b = torch.zeros(n_classes, device=device)
+    W.requires_grad_(True)
+    b.requires_grad_(True)
+    opt = torch.optim.Adam([W, b], lr=lr)
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = F.cross_entropy(X @ W.T + b, y)
+        loss.backward()
+        opt.step()
+    accs = {}
+    with torch.no_grad():
+        for s, f in te_feats.items():
+            preds = (f.to(device) @ W.T + b).argmax(1).cpu().numpy()
+            accs[s] = float((preds == test_labels[s]).mean() * 100)
+    return accs
+
+
+def qda_score(X, y, mus, covs, lam, sigma2, C, chunk=2048):
+    """QDA(收缩协方差)分类;X [N,d], y [N]。"""
+    correct, total = 0, 0
+    for i in range(0, X.shape[0], chunk):
+        Z = X[i : i + chunk]
+        logp = torch.empty(Z.shape[0], C, device=Z.device)
+        for c in range(C):
+            S = (1.0 - lam) * covs[c] + lam * sigma2 * torch.eye(Z.shape[1], device=Z.device)
+            L = torch.linalg.cholesky(S)
+            S_inv = torch.cholesky_inverse(L)
+            d = Z - mus[c]
+            quad = ((d @ S_inv) * d).sum(1)
+            logdet = 2.0 * L.diag().log().sum()
+            logp[:, c] = -0.5 * (quad + logdet)
+        preds = logp.argmax(1)
+        correct += (preds == y[i : i + chunk].to(Z.device)).sum().item()
+        total += Z.shape[0]
+    return float(correct / total * 100)
+
+
+def variant_qda(tr_feats, tr_labels, te_feats, test_labels, n_classes, shrink_grid, last_mask, device):
+    """QDA: 每类均值+协方差,收缩系数 λ 仅在最后任务训练数据上网格选(增量合法)。"""
+    X = tr_feats.to(device)
+    mus, covs, pooled = {}, {}, 0.0
+    n_total = 0
+    for c in range(n_classes):
+        Xc = X[tr_labels == c]
+        mu = Xc.mean(0)
+        diff = Xc - mu
+        cov = (diff.T @ diff) / max(Xc.shape[0] - 1, 1)
+        mus[c] = mu
+        covs[c] = cov
+        pooled += cov.diag().sum()
+        n_total += Xc.shape[0]
+    sigma2 = pooled / n_total / X.shape[1]
+
+    last_X, last_y = X[last_mask], tr_labels[last_mask]
+    best_l, best_acc = None, -1
+    for lam in shrink_grid:
+        acc = qda_score(last_X, last_y, mus, covs, lam, sigma2, n_classes)
+        if acc > best_acc:
+            best_acc, best_l = acc, lam
+
+    accs = {}
+    for s, f in te_feats.items():
+        accs[s] = qda_score(f.to(device), torch.as_tensor(test_labels[s]), mus, covs, best_l, sigma2, n_classes)
+    return accs, best_l
+
+
+def variant_knn(tr_feats, tr_labels, te_feats, test_labels, ks=(1, 5, 20), chunk=512):
+    """k-NN(特征空间近邻投票;样本级几何天花板)。"""
+    X = F.normalize(tr_feats, dim=1)
+    n_classes = int(tr_labels.max()) + 1
+    out = {k: {} for k in ks}
+    for s, f in te_feats.items():
+        Z = F.normalize(f, dim=1)
+        for k in ks:
+            preds = np.empty(Z.shape[0], dtype=np.int64)
+            for i in range(0, Z.shape[0], chunk):
+                sim = Z[i : i + chunk] @ X.T
+                top = sim.topk(k, dim=1).indices.numpy()       # [chunk, k]
+                labs = tr_labels.numpy()[top]
+                pred = np.array([np.argmax(np.bincount(labs[j], minlength=n_classes)) for j in range(top.shape[0])])
+                preds[i : i + chunk] = pred
+            out[k][s] = float((preds == test_labels[s]).mean() * 100)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description='Phase8: post-hoc margin 校准探针')
     parser.add_argument('--config', type=str, default=os.path.join('exps', 'cifar.yaml'))
@@ -135,6 +230,11 @@ def main():
     parser.add_argument('--increment', type=int, default=5)
     parser.add_argument('--seed', type=int, default=1993)
     parser.add_argument('--device', type=str, default='cuda')
+    # 以下四个参数仅为满足 Config 校验(与官方 train.py 的 parser 对齐),本脚本不使用
+    parser.add_argument('--logger', type=str, default='basic')
+    parser.add_argument('--prefix', type=str, default='')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--ckpts_dir', type=str, default=os.path.join('data', 'acmap', 'ckpts'))
     parser.add_argument('--dataset_dir', type=str, default='dataset')
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=300, help='oracle 校准的 CE 训练轮数')
@@ -217,6 +317,22 @@ def main():
     geom_acc = eval_variant(geom_scores, test_labels)
     print(f'[calib] geometry margin: best alpha={best_alpha} (last-task train acc {best_acc:.2f})')
 
+    # ---- 特征级探针: 线性 / QDA(合法) / k-NN(样本级天花板) ----
+    print('[calib] linear probe (all train features) ...')
+    linear_acc = variant_linear(tr_feats, tr_labels, te_feats, test_labels, n_classes, args.epochs, args.lr, device)
+
+    shrink_grid = [float(x) for x in args.alpha_grid.split(',')]
+    last_mask = tr_labels >= ranges[-1][0]
+    print('[calib] QDA with shrinkage (lambda tuned on last-task train data) ...')
+    qda_acc, best_lambda = variant_qda(
+        tr_feats, tr_labels, te_feats, test_labels, n_classes, shrink_grid, last_mask, device
+    )
+    print(f'[calib] QDA best lambda={best_lambda}')
+
+    print('[calib] k-NN (k=1,5,20) ...')
+    knn_acc = variant_knn(tr_feats, tr_labels, te_feats, test_labels)
+    knn_ks = [1, 5, 20]
+
     # ---- 对标 A_tid(任务边界上限) ----
     atid_path = os.path.join(out_dir, 'A_tid_matrix.csv')
     atid_final = None
@@ -229,30 +345,41 @@ def main():
 
     # ---- 输出 ----
     csv_path = os.path.join(out_dir, 'calib_probe.csv')
+    header = (['task', 'baseline', 'oracle', 'geometry', 'linear', 'qda', 'knn1', 'knn5', 'knn20', 'A_tid']
+              + ['oracle_rec%', 'geometry_rec%', 'linear_rec%', 'qda_rec%', 'knn1_rec%', 'knn5_rec%', 'knn20_rec%'])
     with open(csv_path, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['task', 'baseline', 'oracle', 'geometry', 'A_tid',
-                    'oracle_recovery%', 'geometry_recovery%'])
+        w.writerow(header)
         rows = []
         for s in range(1, T + 1):
             bv, ov, gv = base_acc[s], oracle_acc[s], geom_acc[s]
+            lv, qv = linear_acc[s], qda_acc[s]
+            k1, k5, k20 = knn_acc[1][s], knn_acc[5][s], knn_acc[20][s]
             tv = float(atid_final[s - 1]) if atid_final is not None else float('nan')
             gap = tv - bv
-            rec_o = 100 * (ov - bv) / gap if gap > 0 else float('nan')
-            rec_g = 100 * (gv - bv) / gap if gap > 0 else float('nan')
-            w.writerow([s, f'{bv:.2f}', f'{ov:.2f}', f'{gv:.2f}', f'{tv:.2f}',
-                        f'{rec_o:.1f}', f'{rec_g:.1f}'])
-            rows.append((bv, ov, gv, tv, rec_o, rec_g))
+            def rec(v):
+                return 100 * (v - bv) / gap if gap > 0 else float('nan')
+            line = [s, f'{bv:.2f}', f'{ov:.2f}', f'{gv:.2f}', f'{lv:.2f}', f'{qv:.2f}',
+                    f'{k1:.2f}', f'{k5:.2f}', f'{k20:.2f}', f'{tv:.2f}',
+                    f'{rec(ov):.1f}', f'{rec(gv):.1f}', f'{rec(lv):.1f}', f'{rec(qv):.1f}',
+                    f'{rec(k1):.1f}', f'{rec(k5):.1f}', f'{rec(k20):.1f}']
+            w.writerow(line)
+            rows.append([bv, ov, gv, lv, qv, k1, k5, k20, tv,
+                         rec(ov), rec(gv), rec(lv), rec(qv), rec(k1), rec(k5), rec(k20)])
 
     def mean(i):
         return np.nanmean([r[i] for r in rows])
 
     print('\n[calib] 汇总(末时刻,任务无关口径, mean over tasks):')
-    print(f'  baseline        : {mean(0):.2f}')
-    print(f'  oracle (天花板) : {mean(1):.2f}   (追回率 {mean(4):.1f}%)')
-    print(f'  geometry (合法) : {mean(2):.2f}   (追回率 {mean(5):.1f}%)')
+    print(f'  baseline            : {mean(0):.2f}')
+    print(f'  oracle bias+scale   : {mean(1):.2f}   (追回率 {mean(9):.1f}%)')
+    print(f'  geometry margin     : {mean(2):.2f}   (追回率 {mean(10):.1f}%)')
+    print(f'  linear probe        : {mean(3):.2f}   (追回率 {mean(11):.1f}%)')
+    print(f'  QDA (合法)          : {mean(4):.2f}   (追回率 {mean(12):.1f}%)')
+    print(f'  kNN-1 / 5 / 20      : {mean(5):.2f} / {mean(6):.2f} / {mean(7):.2f}   '
+          f'(追回率 {mean(13):.1f}% / {mean(14):.1f}% / {mean(15):.1f}%)')
     if atid_final is not None:
-        print(f'  A_tid (上限)    : {mean(3):.2f}')
+        print(f'  A_tid (上限)        : {mean(8):.2f}')
     print(f'\n[calib] 明细已写入 {csv_path}')
 
 
